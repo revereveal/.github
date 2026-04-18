@@ -1,0 +1,113 @@
+# .github/workflows/orphan-branch-reminder.yml
+#
+# Weekly scan across org. Finds branches older than 14 days with no open PR.
+# Posts a comment-on-issue (or Slack message) asking: merge / PR / archive?
+#
+# Install: place in revereveal/.github/.github/workflows/ (org-level workflow)
+# OR per-repo at <repo>/.github/workflows/orphan-branch-reminder.yml
+#
+# Requires: PAT with org:read + repo:read scope stored as secret ORG_SCAN_TOKEN
+# (or use GITHUB_TOKEN if repo-scoped).
+
+name: Orphan branch reminder
+
+on:
+  schedule:
+    - cron: "0 13 * * 1"  # Every Monday at 13:00 UTC (9am ET)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Scan for orphan branches
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.ORG_SCAN_TOKEN || secrets.GITHUB_TOKEN }}
+          script: |
+            const REPO_OWNER = 'revereveal';  // change for jtalk22 runs
+            const DAYS_THRESHOLD = 14;
+            const cutoff = new Date(Date.now() - DAYS_THRESHOLD * 24 * 3600 * 1000);
+
+            // Get all repos in org (or just current repo if token is repo-scoped)
+            let repos;
+            try {
+              const r = await github.request('GET /orgs/{org}/repos', { org: REPO_OWNER, per_page: 100 });
+              repos = r.data.filter(repo => !repo.archived && !repo.fork);
+            } catch (e) {
+              // Fallback to current repo only
+              repos = [{ name: context.repo.repo, owner: { login: context.repo.owner } }];
+            }
+
+            const orphans = [];
+            for (const repo of repos) {
+              try {
+                const { data: branches } = await github.request('GET /repos/{owner}/{repo}/branches', {
+                  owner: repo.owner.login, repo: repo.name, per_page: 100
+                });
+                const { data: prs } = await github.request('GET /repos/{owner}/{repo}/pulls', {
+                  owner: repo.owner.login, repo: repo.name, state: 'all', per_page: 100
+                });
+                const branchesWithPR = new Set(prs.map(p => p.head.ref));
+
+                for (const br of branches) {
+                  if (br.name === repo.default_branch) continue;
+                  if (branchesWithPR.has(br.name)) continue;
+
+                  // Get branch tip date
+                  const { data: commit } = await github.request('GET /repos/{owner}/{repo}/commits/{sha}', {
+                    owner: repo.owner.login, repo: repo.name, sha: br.commit.sha
+                  });
+                  const commitDate = new Date(commit.commit.author.date);
+                  if (commitDate > cutoff) continue;
+
+                  orphans.push({
+                    repo: repo.name,
+                    branch: br.name,
+                    sha: br.commit.sha.slice(0, 10),
+                    age_days: Math.floor((Date.now() - commitDate.getTime()) / (24*3600*1000))
+                  });
+                }
+              } catch (e) {
+                console.log(`Skipped ${repo.name}: ${e.message}`);
+              }
+            }
+
+            if (orphans.length === 0) {
+              console.log('No orphan branches found. Clean.');
+              return;
+            }
+
+            // Sort by age desc
+            orphans.sort((a, b) => b.age_days - a.age_days);
+
+            // Group by repo for output
+            const byRepo = {};
+            for (const o of orphans) { (byRepo[o.repo] = byRepo[o.repo] || []).push(o); }
+
+            let body = `## Orphan branch report\n\n`;
+            body += `${orphans.length} branches across ${Object.keys(byRepo).length} repos haven't had commits in ${DAYS_THRESHOLD}+ days and have no open PR.\n\n`;
+            body += `For each: **merge**, **open a PR**, or **archive** (rename to \`archive/<original-name>\` to move out of the orphan set).\n\n`;
+
+            for (const [repo, list] of Object.entries(byRepo)) {
+              body += `### \`${repo}\` (${list.length})\n\n`;
+              for (const o of list.slice(0, 10)) {
+                body += `- \`${o.branch}\` — ${o.age_days}d old · \`${o.sha}\`\n`;
+              }
+              if (list.length > 10) body += `- ...and ${list.length - 10} more\n`;
+              body += '\n';
+            }
+
+            // Post as issue in the .github repo (or in current repo if running per-repo)
+            await github.request('POST /repos/{owner}/{repo}/issues', {
+              owner: REPO_OWNER,
+              repo: '.github',  // central home for governance issues
+              title: `Weekly orphan-branch report — ${new Date().toISOString().slice(0,10)}`,
+              body,
+              labels: ['governance', 'orphan-branches']
+            });
