@@ -9,6 +9,7 @@ This org is operated by one person. GitHub automation should reduce cognitive lo
 - When a third-party action is necessary, pin it to a full commit SHA because org policy requires SHA pins.
 - Avoid scheduled workflows that create noisy issues or failed-run notifications unless they produce a clear next action.
 - Treat stale failure notifications as stale evidence. Check the latest run before spending time fixing an old run.
+- For governance workflows, prefer PR/manual dry-runs over live side effects so the check proves the script without creating more inbox work.
 
 ## PR and dependency queue rules
 

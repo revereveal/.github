@@ -18,9 +18,18 @@
 name: Orphan branch reminder
 
 on:
+  pull_request:
+    paths:
+      - ".github/workflows/orphan-branch-sweep.yml"
+      - "docs/SOLO-DEV-GITHUB-OPS.md"
   schedule:
     - cron: "0 13 * * 1"  # Every Monday at 13:00 UTC (9am ET)
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Scan and print the report without creating an issue"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -36,10 +45,12 @@ jobs:
           GH_TOKEN: ${{ secrets.ORG_SCAN_TOKEN || github.token }}
           REPO_OWNER: revereveal
           GITHUB_REPOSITORY: ${{ github.repository }}
+          DRY_RUN: ${{ github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
         run: |
           node --input-type=module <<'NODE'
             const token = process.env.GH_TOKEN;
             const REPO_OWNER = process.env.REPO_OWNER || 'revereveal';
+            const dryRun = String(process.env.DRY_RUN || 'false').toLowerCase() === 'true';
             const DAYS_THRESHOLD = 14;
             const cutoff = new Date(Date.now() - DAYS_THRESHOLD * 24 * 3600 * 1000);
             const [contextOwner, contextRepo] = (process.env.GITHUB_REPOSITORY || `${REPO_OWNER}/.github`).split('/');
@@ -149,6 +160,12 @@ jobs:
               }
               if (list.length > 10) body += `- ...and ${list.length - 10} more\n`;
               body += '\n';
+            }
+
+            if (dryRun) {
+              console.log('DRY_RUN=true; report follows, but no issue will be created.');
+              console.log(body);
+              process.exit(0);
             }
 
             // Post as issue in the .github repo (or in current repo if running per-repo)
