@@ -3,6 +3,12 @@
 # Weekly scan across org. Finds branches older than 14 days with no open PR.
 # Posts a comment-on-issue (or Slack message) asking: merge / PR / archive?
 #
+# Solo-dev operating note:
+# - Keep this workflow dependency-free by design. The org requires full-SHA
+#   action pins, and this job does not need a third-party action.
+# - Do not reintroduce actions/github-script here unless there is a concrete
+#   reason that beats the current inline Node API call.
+#
 # Install: place in revereveal/.github/.github/workflows/ (org-level workflow)
 # OR per-repo at <repo>/.github/workflows/orphan-branch-reminder.yml
 #
@@ -12,9 +18,18 @@
 name: Orphan branch reminder
 
 on:
+  pull_request:
+    paths:
+      - ".github/workflows/orphan-branch-sweep.yml"
+      - "docs/SOLO-DEV-GITHUB-OPS.md"
   schedule:
     - cron: "0 13 * * 1"  # Every Monday at 13:00 UTC (9am ET)
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Scan and print the report without creating an issue"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -26,33 +41,76 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Scan for orphan branches
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # pin:v7
-        with:
-          github-token: ${{ secrets.ORG_SCAN_TOKEN || secrets.GITHUB_TOKEN }}
-          script: |
-            const REPO_OWNER = 'revereveal';  // change for jtalk22 runs
+        env:
+          GH_TOKEN: ${{ secrets.ORG_SCAN_TOKEN || github.token }}
+          REPO_OWNER: revereveal
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          DRY_RUN: ${{ github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+        run: |
+          node --input-type=module <<'NODE'
+            const token = process.env.GH_TOKEN;
+            const REPO_OWNER = process.env.REPO_OWNER || 'revereveal';
+            const dryRun = String(process.env.DRY_RUN || 'false').toLowerCase() === 'true';
             const DAYS_THRESHOLD = 14;
             const cutoff = new Date(Date.now() - DAYS_THRESHOLD * 24 * 3600 * 1000);
+            const [contextOwner, contextRepo] = (process.env.GITHUB_REPOSITORY || `${REPO_OWNER}/.github`).split('/');
 
-            // Get all repos in org (or just current repo if token is repo-scoped)
+            if (!token) {
+              throw new Error('GH_TOKEN is missing; provide ORG_SCAN_TOKEN or allow github.token.');
+            }
+
+            async function request(method, path, body) {
+              const response = await fetch(`https://api.github.com${path}`, {
+                method,
+                headers: {
+                  'Authorization': `Bearer ${token}`,
+                  'Accept': 'application/vnd.github+json',
+                  'X-GitHub-Api-Version': '2022-11-28',
+                  ...(body ? { 'Content-Type': 'application/json' } : {}),
+                },
+                ...(body ? { body: JSON.stringify(body) } : {}),
+              });
+              const text = await response.text();
+              const data = text ? JSON.parse(text) : null;
+              if (!response.ok) {
+                const message = data?.message || text || response.statusText;
+                const error = new Error(`${method} ${path} failed: ${response.status} ${message}`);
+                error.status = response.status;
+                throw error;
+              }
+              return data;
+            }
+
+            async function paginate(path) {
+              const separator = path.includes('?') ? '&' : '?';
+              const items = [];
+              for (let page = 1; page <= 10; page += 1) {
+                const data = await request('GET', `${path}${separator}per_page=100&page=${page}`);
+                if (!Array.isArray(data) || data.length === 0) break;
+                items.push(...data);
+                if (data.length < 100) break;
+              }
+              return items;
+            }
+
+            // Get all repos in org (or just current repo if token is repo-scoped).
             let repos;
             try {
-              const r = await github.request('GET /orgs/{org}/repos', { org: REPO_OWNER, per_page: 100 });
-              repos = r.data.filter(repo => !repo.archived && !repo.fork);
+              const orgRepos = await paginate(`/orgs/${encodeURIComponent(REPO_OWNER)}/repos?type=all`);
+              repos = orgRepos.filter(repo => !repo.archived && !repo.fork);
             } catch (e) {
               // Fallback to current repo only
-              repos = [{ name: context.repo.repo, owner: { login: context.repo.owner } }];
+              console.log(`Org scan unavailable; falling back to current repo: ${e.message}`);
+              repos = [await request('GET', `/repos/${encodeURIComponent(contextOwner)}/${encodeURIComponent(contextRepo)}`)];
             }
 
             const orphans = [];
             for (const repo of repos) {
+              const owner = repo.owner.login;
+              const repoName = repo.name;
               try {
-                const { data: branches } = await github.request('GET /repos/{owner}/{repo}/branches', {
-                  owner: repo.owner.login, repo: repo.name, per_page: 100
-                });
-                const { data: prs } = await github.request('GET /repos/{owner}/{repo}/pulls', {
-                  owner: repo.owner.login, repo: repo.name, state: 'all', per_page: 100
-                });
+                const branches = await paginate(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repoName)}/branches`);
+                const prs = await paginate(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repoName)}/pulls?state=all`);
                 const branchesWithPR = new Set(prs.map(p => p.head.ref));
 
                 for (const br of branches) {
@@ -60,14 +118,15 @@ jobs:
                   if (branchesWithPR.has(br.name)) continue;
 
                   // Get branch tip date
-                  const { data: commit } = await github.request('GET /repos/{owner}/{repo}/commits/{sha}', {
-                    owner: repo.owner.login, repo: repo.name, sha: br.commit.sha
-                  });
-                  const commitDate = new Date(commit.commit.author.date);
+                  const commit = await request(
+                    'GET',
+                    `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repoName)}/commits/${encodeURIComponent(br.commit.sha)}`
+                  );
+                  const commitDate = new Date(commit.commit.author?.date || commit.commit.committer?.date);
                   if (commitDate > cutoff) continue;
 
                   orphans.push({
-                    repo: repo.name,
+                    repo: repoName,
                     branch: br.name,
                     sha: br.commit.sha.slice(0, 10),
                     age_days: Math.floor((Date.now() - commitDate.getTime()) / (24*3600*1000))
@@ -80,7 +139,7 @@ jobs:
 
             if (orphans.length === 0) {
               console.log('No orphan branches found. Clean.');
-              return;
+              process.exit(0);
             }
 
             // Sort by age desc
@@ -103,11 +162,24 @@ jobs:
               body += '\n';
             }
 
+            if (dryRun) {
+              console.log('DRY_RUN=true; report follows, but no issue will be created.');
+              console.log(body);
+              process.exit(0);
+            }
+
             // Post as issue in the .github repo (or in current repo if running per-repo)
-            await github.request('POST /repos/{owner}/{repo}/issues', {
-              owner: REPO_OWNER,
-              repo: '.github',  // central home for governance issues
+            const issuePayload = {
               title: `Weekly orphan-branch report — ${new Date().toISOString().slice(0,10)}`,
               body,
               labels: ['governance', 'orphan-branches']
-            });
+            };
+            try {
+              await request('POST', `/repos/${encodeURIComponent(REPO_OWNER)}/.github/issues`, issuePayload);
+            } catch (e) {
+              if (e.status !== 422) throw e;
+              console.log(`Issue labels unavailable; retrying without labels: ${e.message}`);
+              delete issuePayload.labels;
+              await request('POST', `/repos/${encodeURIComponent(REPO_OWNER)}/.github/issues`, issuePayload);
+            }
+          NODE
